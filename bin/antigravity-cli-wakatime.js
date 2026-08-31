@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -135,7 +135,7 @@ async function syncAiHeartbeats(cliPath, input) {
 
   if (projectFolder) args.push('--project-folder', projectFolder);
 
-  log('DEBUG', `Syncing AI heartbeats: ${formatArguments(cliPath, args)}`);
+  log('INFO', `Syncing AI heartbeats: ${formatArguments(cliPath, args)}`);
 
   try {
     const result = await execFile(cliPath, args, {
@@ -145,6 +145,7 @@ async function syncAiHeartbeats(cliPath, input) {
     });
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
     if (output) log('WARN', output);
+    log('INFO', `Synced AI heartbeats using ${plugin}`);
   } catch (error) {
     logException('WARN', error);
   }
@@ -158,9 +159,10 @@ function getAntigravityRuntime(input) {
     if (runtime) return runtime;
   }
 
-  const installedRuntime = getAntigravityRuntimeFromPath(__filename);
-  if (installedRuntime) return installedRuntime;
-
+  // The plugin is always installed under ~/.gemini/config/plugins/, a path
+  // shared by every Antigravity product, so its own location can't identify
+  // the runtime (this used to make CLI runs report as antigravity-desktop).
+  // Trust the product env vars instead, then default to the CLI product.
   if (process.env.ANTIGRAVITY_DESKTOP_VERSION) return ANTIGRAVITY_DESKTOP;
   if (process.env.ANTIGRAVITY_IDE_VERSION) return ANTIGRAVITY_IDE;
   return ANTIGRAVITY_CLI;
@@ -173,7 +175,6 @@ function getAntigravityRuntimeFromPath(candidate) {
   if (normalized.includes('/.gemini/antigravity-cli/')) return ANTIGRAVITY_CLI;
   if (normalized.includes('/.gemini/antigravity-ide/')) return ANTIGRAVITY_IDE;
   if (normalized.includes('/.gemini/antigravity/')) return ANTIGRAVITY_DESKTOP;
-  if (normalized.includes('/.gemini/config/plugins/')) return ANTIGRAVITY_DESKTOP;
   return undefined;
 }
 
