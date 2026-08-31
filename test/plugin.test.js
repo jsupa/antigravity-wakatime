@@ -80,12 +80,13 @@ async function waitForCall(captureFile) {
   return [];
 }
 
-test('hooks invoke the runner instead of node directly', () => {
-  const hooks = fs.readFileSync(hookConfigPath, 'utf8');
+test('hooks use the cross-platform runner command', () => {
+  const hooks = JSON.parse(fs.readFileSync(hookConfigPath, 'utf8'))['antigravity-cli-wakatime'];
+  const commands = [hooks.PreInvocation[0].command, hooks.PostToolUse[0].hooks[0].command];
 
-  assert.doesNotMatch(hooks, /\bnode\b/);
-  assert.match(hooks, /\.\/scripts\/run --event=preInvocation/);
-  assert.match(hooks, /\.\/scripts\/run --event=postToolUse/);
+  assert.deepEqual(commands, ['scripts/run --event=preInvocation', 'scripts/run --event=postToolUse']);
+  assert.ok(fs.existsSync(path.resolve(__dirname, '..', 'scripts', 'run')));
+  assert.ok(fs.existsSync(path.resolve(__dirname, '..', 'scripts', 'run.cmd')));
 });
 
 test('runner uses NODE_BIN when node is unavailable in PATH', { skip: process.platform === 'win32' }, () => {
