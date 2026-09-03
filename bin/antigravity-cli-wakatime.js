@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.0.1';
+const VERSION = '1.1.0';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -149,6 +149,169 @@ async function syncAiHeartbeats(cliPath, input) {
   } catch (error) {
     logException('WARN', error);
   }
+
+  await sendEditedFileHeartbeats(cliPath, runtime, plugin, projectFolder);
+}
+
+const FILE_TOOL_NAMES = new Set(['replace_file_content', 'write_to_file', 'create_file']);
+const MAX_FILE_HEARTBEATS = 50;
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const MAX_TRANSCRIPTS_TO_SCAN = 3;
+
+function getBrainDirs(runtime) {
+  // Antigravity always writes its brain under the OS home dir, separate from
+  // any WAKATIME_HOME override, so resolve it directly.
+  const home = process.env[isWindows() ? 'USERPROFILE' : 'HOME'] || os.homedir() || process.cwd();
+  // Mirrors wakatime-cli's Antigravity parser: transcripts live under
+  // ~/.gemini/<product>/brain/<session>/.system_generated/logs/transcript.jsonl
+  if (runtime === ANTIGRAVITY_IDE) return [path.join(home, '.gemini', 'antigravity-ide', 'brain')];
+  if (runtime === ANTIGRAVITY_DESKTOP) return [path.join(home, '.gemini', 'antigravity', 'brain')];
+  return [path.join(home, '.gemini', 'antigravity-cli', 'brain')];
+}
+
+async function sendEditedFileHeartbeats(cliPath, runtime, plugin, projectFolder) {
+  const files = collectEditedFiles(runtime);
+  if (!files.size) return;
+
+  // Main heartbeat = first file; remaining files are sent as extra heartbeats.
+  const entities = Array.from(files.entries()).slice(0, MAX_FILE_HEARTBEATS);
+  const args = ['--entity', entities[0][0], '--category', 'ai coding', '--plugin', plugin];
+  if (projectFolder) args.push('--project-folder', projectFolder);
+
+  const extras = entities.slice(1).map(([entity, timestamp]) => ({
+    entity,
+    category: 'ai coding',
+    timestamp: Math.round(timestamp / 1000),
+    time: Math.round(timestamp / 1000),
+  }));
+  if (extras.length) args.push('--extra-heartbeats');
+
+  log('INFO', `Sending ${entities.length} file heartbeats: ${formatArguments(cliPath, args)}`);
+  try {
+    const result = await runCli(cliPath, args, extras.length ? JSON.stringify(extras) : undefined);
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    if (output) log('WARN', output);
+    log('INFO', `Sent ${entities.length} file heartbeats using ${plugin}`);
+  } catch (error) {
+    logException('WARN', error);
+  }
+}
+
+function collectEditedFiles(runtime) {
+  // abs file path -> epoch millis of the latest edit (from created_at).
+  const files = new Map();
+  for (const brainDir of getBrainDirs(runtime)) {
+    let sessionDirs;
+    try {
+      sessionDirs = fs.readdirSync(brainDir);
+    } catch (_) {
+      continue;
+    }
+    const transcripts = [];
+    for (const sessionDir of sessionDirs) {
+      const transcript = path.join(brainDir, sessionDir, '.system_generated', 'logs', 'transcript.jsonl');
+      if (!fs.existsSync(transcript)) continue;
+      try {
+        if (fs.statSync(transcript).size > 0) transcripts.push(transcript);
+      } catch (_) {}
+    }
+    // The active session always has the newest transcript, so only scan the
+    // newest ones to keep per-event latency bounded (the hook timeout is 5s).
+    transcripts.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    for (const transcript of transcripts.slice(0, MAX_TRANSCRIPTS_TO_SCAN)) {
+      scanTranscriptForEditedFiles(transcript, files);
+    }
+  }
+  return files;
+}
+
+function scanTranscriptForEditedFiles(transcriptPath, files) {
+  // wakatime-cli's own Antigravity parser only creates file heartbeats from
+  // "CODE_ACTION" transcript lines, which this Antigravity CLI build never
+  // writes: it records edits as tool_calls (e.g. replace_file_content or
+  // write_to_file with a TargetFile arg). Parse those ourselves so real file
+  // paths reach the dashboard instead of only session UUID entities.
+  let buffer;
+  try {
+    const stat = fs.statSync(transcriptPath);
+    // Edits can sit anywhere in the transcript, so parse the whole file when
+    // it is small enough; fall back to the tail for very large transcripts.
+    if (stat.size > 8 * 1024 * 1024) {
+      const size = TRANSCRIPT_TAIL_BYTES;
+      const fd = fs.openSync(transcriptPath, 'r');
+      try {
+        buffer = fs.readSync(fd, Buffer.alloc(size), 0, size, stat.size - size).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      buffer = fs.readFileSync(transcriptPath, 'utf8');
+    }
+  } catch (_) {
+    return;
+  }
+  // Drop the leading partial line (no JSON preamble survives in the tail).
+  const firstNewline = buffer.indexOf('\n');
+  const lines = firstNewline === -1 ? [buffer] : buffer.slice(firstNewline + 1).split('\n');
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
+    if (!Array.isArray(entry.tool_calls)) continue;
+    const timestamp = Date.parse(entry.created_at || '');
+    for (const toolCall of entry.tool_calls) {
+      if (!toolCall || !FILE_TOOL_NAMES.has(toolCall.name)) continue;
+      // Transcript arg values are JSON-encoded strings: the real path
+      // "/Users/<user>/proj/App.tsx" is stored as the value
+      // "\"/Users/<user>/proj/App.tsx\"". Decode before use so the entity is
+      // a real path, not a quoted one.
+      const rawTarget = toolCall.args && toolCall.args.TargetFile;
+      const target = decodeArgString(rawTarget);
+      if (typeof target !== 'string' || !target.trim()) continue;
+      const absTarget = path.resolve(target);
+      if (!fs.existsSync(absTarget)) continue; // deleted files are not tracked
+      const previous = files.get(absTarget);
+      if (previous === undefined || (Number.isFinite(timestamp) && timestamp > previous)) {
+        files.set(absTarget, Number.isFinite(timestamp) ? timestamp : 0);
+      }
+    }
+  }
+}
+
+function decodeArgString(value) {
+  if (typeof value !== 'string' || !value.trim()) return value;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (_) {}
+  }
+  return value;
+}
+
+function runCli(cliPath, args, stdin) {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(cliPath, args, {
+      windowsHide: true,
+      env: getChildEnv(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`wakatime-cli exited with code ${code}: ${`${stdout}${stderr}`.trim()}`));
+    });
+    if (stdin !== undefined) child.stdin.write(stdin);
+    child.stdin.end();
+  });
 }
 
 function getAntigravityRuntime(input) {
