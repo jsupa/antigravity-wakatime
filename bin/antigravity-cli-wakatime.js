@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -150,7 +150,8 @@ async function syncAiHeartbeats(cliPath, input) {
     logException('WARN', error);
   }
 
-  await sendEditedFileHeartbeats(runtime, plugin, projectFolder);
+  const modelToken = aiModelUserAgentToken(input.modelName || '');
+  await sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelToken);
 }
 
 const FILE_TOOL_NAMES = new Set(['replace_file_content', 'write_to_file', 'create_file']);
@@ -172,7 +173,8 @@ function getBrainDirs(runtime) {
 const STATE_FILE = 'antigravity-cli-wakatime-state.json';
 const API_BASE = process.env.WAKATIME_PLUGIN_API_URL || 'https://wakatime.com/api/v1';
 
-async function sendEditedFileHeartbeats(runtime, plugin, projectFolder) {
+async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelToken) {
+  const userAgent = modelToken ? `${modelToken} ${plugin}` : plugin;
   const { files, tokensIn, tokensOut, maxTimestamp, sessionId } = collectEditedFiles(runtime);
   if (!files.size) return;
 
@@ -195,6 +197,10 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder) {
       is_write: true,
       lines: info.total,
       ai_line_changes: info.added - info.removed,
+      // The user_agent carries the model token (e.g. gemini/3.8-flash-high);
+      // the server parses it into ai_model / ai_model_version, which is what
+      // powers WakaTime's model-specific token breakdowns.
+      user_agent: userAgent,
     };
     // The CLI has no flags or extra-heartbeat keys for AI tokens (upstream
     // hardcodes empty tokens for this transcript format), so only a direct
@@ -270,6 +276,53 @@ function getProjectNameForFile(entity, cache) {
 function estimateTokens(text) {
   if (!text) return 0;
   return Math.max(1, Math.round(String(text).length / 4));
+}
+
+// Port of wakatime-cli's aiModelUserAgentToken (pkg/ai/ai.go): normalizes a
+// model id like "gemini-3.8-flash-high" into the "gemini/3.8-flash-high"
+// token the server recognizes for model attribution.
+function aiModelUserAgentToken(model, complexity) {
+  if (typeof model !== 'string') return '';
+  model = model.trim().replace(/\s+/g, '-').replace(/^\/+|\/+$/g, '');
+  if (!model) return '';
+
+  complexity = (typeof complexity === 'string' ? complexity : '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/^[-_/.]+|[-_/.]+$/g, '');
+  if (complexity && !model.toLowerCase().endsWith(`-${complexity.toLowerCase()}`)) {
+    model += `-${complexity}`;
+  }
+
+  const firstSlash = model.indexOf('/');
+  if (firstSlash > 0) {
+    const product = model.slice(0, firstSlash);
+    const version = model.slice(firstSlash + 1);
+    if (product && version && /^[0-9]/.test(version[0])) return `${product}/${version}`;
+  }
+
+  if (model.lastIndexOf('/') !== -1) {
+    model = model.slice(model.lastIndexOf('/') + 1).replace(/^[-_.]+|[-_.]+$/g, '');
+  }
+
+  const parts = model.split(/[-_]/);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    for (let j = 0; j < part.length; j++) {
+      const code = part.charCodeAt(j);
+      if (code < 48 || code > 57) continue;
+      if (j === 0) {
+        if (i === 0) return '';
+        return `${parts[i - 1]}/${parts.slice(i).join('-')}`;
+      }
+      let product = part.slice(0, j);
+      if (product.toLowerCase() === 'v' && i > 0) product = parts[i - 1];
+      let version = part.slice(j);
+      if (i + 1 < parts.length) version += `-${parts.slice(i + 1).join('-')}`;
+      return `${product}/${version}`;
+    }
+  }
+  return '';
 }
 
 function getSessionId(transcriptPath) {
