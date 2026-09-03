@@ -381,6 +381,7 @@ function collectEditedFiles(runtime) {
       if (!sessionId) sessionId = getSessionId(transcript);
     }
   }
+  log('DEBUG', `collectEditedFiles: ${files.size} files, lastEditTime=${lastEditTime}, maxTs=${tokens.maxTs}, in=${tokens.input}, out=${tokens.output}`);
   return { files, tokensIn: tokens.input, tokensOut: tokens.output, maxTimestamp: tokens.maxTs, sessionId };
 }
 
@@ -412,6 +413,7 @@ function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, token
   // Drop the leading partial line (no JSON preamble survives in the tail).
   const firstNewline = buffer.indexOf('\n');
   const lines = firstNewline === -1 ? [buffer] : buffer.slice(firstNewline + 1).split('\n');
+  let editsScanned = 0;
   for (const line of lines) {
     if (!line.trim()) continue;
     let entry;
@@ -439,6 +441,7 @@ function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, token
     if (timestamp <= lastEditTime) continue; // only new edits since last event
     if (!Array.isArray(entry.tool_calls)) continue;
     for (const toolCall of entry.tool_calls) {
+      editsScanned++;
       if (!toolCall || !FILE_TOOL_NAMES.has(toolCall.name)) continue;
       // Transcript arg values are JSON-encoded strings: the real path
       // "/Users/<user>/proj/App.tsx" is stored as the value
@@ -448,7 +451,10 @@ function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, token
       const target = decodeArgString(rawTarget);
       if (typeof target !== 'string' || !target.trim()) continue;
       const absTarget = path.resolve(target);
-      if (!fs.existsSync(absTarget)) continue; // deleted files are not tracked
+      if (!fs.existsSync(absTarget)) {
+        log('DEBUG', `Edited file not found, skipping: ${absTarget} (raw: ${String(rawTarget).slice(0, 60)})`);
+        continue;
+      }
       const info = editLineChanges(toolCall.args);
       const previous = files.get(absTarget);
       if (previous === undefined || timestamp > previous.timestamp) {
@@ -456,6 +462,7 @@ function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, token
       }
     }
   }
+  log('DEBUG', `scanTranscriptForEditedFiles: ${path.basename(path.dirname(path.dirname(path.dirname(transcriptPath))))} edits=${editsScanned}`);
 }
 
 function editLineChanges(args) {
