@@ -1,6 +1,6 @@
 {
   "name": "antigravity-cli-wakatime",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "WakaTime plugin for Antigravity and Antigravity CLI",
   "author": {
     "name": "WakaTime",

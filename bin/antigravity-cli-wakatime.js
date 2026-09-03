@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -227,15 +227,6 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
       // powers WakaTime's model-specific token breakdowns.
       user_agent: userAgent,
     };
-    // The CLI has no flags or extra-heartbeat keys for AI tokens (upstream
-    // hardcodes empty tokens for this transcript format), so only a direct
-    // API post can carry token counts. The transcript records no usage
-    // numbers either, so tokens are estimated at ~4 chars per token, and the
-    // whole event's estimate rides on the first file heartbeat.
-    if (idx === 0) {
-      payload.ai_input_tokens = tokensIn;
-      payload.ai_output_tokens = tokensOut;
-    }
     if (sessionId) payload.ai_session = sessionId;
     const project = getProjectNameForFile(entity, projectCache);
     if (project) payload.project = project;
@@ -249,6 +240,11 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
   }
   log('INFO', `Posted ${posted} file heartbeats using ${plugin}`);
   if (failed) log('WARN', `${failed} file heartbeats failed to post`);
+  // Tokens live on the session's app row (exactly where wakatime-cli's own
+  // adapters put them); file rows carry lines and real paths only.
+  if (sessionId && tokensIn + tokensOut > 0) {
+    await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp);
+  }
   if (maxTimestamp) saveLastEditTime(maxTimestamp);
 }
 
