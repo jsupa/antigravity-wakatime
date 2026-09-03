@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -176,11 +176,21 @@ const API_BASE = process.env.WAKATIME_PLUGIN_API_URL || 'https://wakatime.com/ap
 async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelToken) {
   const userAgent = modelToken ? `${modelToken} ${plugin}` : plugin;
   const { files, tokensIn, tokensOut, maxTimestamp, sessionId } = collectEditedFiles(runtime);
-  if (!files.size) return;
+  if (!maxTimestamp) return;
 
   const apiKey = getApiKey();
   if (!apiKey) {
     log('WARN', 'No api_key in ~/.wakatime.cfg, skipping file heartbeats');
+    return;
+  }
+
+  if (!files.size) {
+    // No new file edits, but (possible) new model activity: post a session
+    // heartbeat so the dashboard token totals keep growing between edits.
+    if (sessionId && tokensIn + tokensOut > 0) {
+      await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp);
+    }
+    if (maxTimestamp) saveLastEditTime(maxTimestamp);
     return;
   }
 
@@ -225,6 +235,32 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
   log('INFO', `Posted ${posted} file heartbeats using ${plugin}`);
   if (failed) log('WARN', `${failed} file heartbeats failed to post`);
   if (maxTimestamp) saveLastEditTime(maxTimestamp);
+}
+
+async function postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp) {
+  const payload = {
+    entity: `${getRuntimeDisplayName(runtime)} ${sessionId}`,
+    type: 'app',
+    category: 'ai coding',
+    time: Math.round(maxTimestamp / 1000),
+    is_write: true,
+    ai_session: sessionId,
+    ai_input_tokens: tokensIn,
+    ai_output_tokens: tokensOut,
+    user_agent: userAgent,
+  };
+  try {
+    await postHeartbeat(apiKey, payload);
+    log('INFO', `Posted session tokens (in=${tokensIn}, out=${tokensOut}) using ${plugin}`);
+  } catch (error) {
+    logException('WARN', error);
+  }
+}
+
+function getRuntimeDisplayName(runtime) {
+  if (runtime === ANTIGRAVITY_IDE) return 'Antigravity IDE';
+  if (runtime === ANTIGRAVITY_DESKTOP) return 'Antigravity';
+  return 'Antigravity CLI';
 }
 
 function getApiKey() {
