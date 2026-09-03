@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.4.1';
+const VERSION = '1.5.0';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -351,8 +351,10 @@ async function runBackfill() {
     const sessionId = getSessionId(transcript);
     if (tokens.input + tokens.output < 500) continue; // skip trivial sessions
     const userAgent = modelToken ? `${modelToken} ${plugin}` : plugin;
+    const multiplier = getTokenMultiplier();
     await postSessionHeartbeat(
-      apiKey, ANTIGRAVITY_CLI, plugin, userAgent, sessionId, tokens.input, tokens.output, tokens.maxTs,
+      apiKey, ANTIGRAVITY_CLI, plugin, userAgent, sessionId,
+      Math.round(tokens.input * multiplier), Math.round(tokens.output * multiplier), tokens.maxTs,
     );
     posted++;
   }
@@ -367,6 +369,16 @@ function modelTokenForEntry(entry) {
   if (!/\d/.test(name)) return '';
   const complexity = String(match[2] || '').trim().toLowerCase();
   return aiModelUserAgentToken(name, complexity);
+}
+
+function getTokenMultiplier() {
+  // Antigravity persists no per-request usage; content-based estimates
+  // undercount real spend. Users can calibrate via ai_token_multiplier in
+  // ~/.wakatime.cfg ([settings], default 1), e.g. 60 when the provider
+  // reports ~120M/day vs ~2M estimated.
+  const value = Number(getSetting('settings', 'ai_token_multiplier'));
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  return Math.min(value, 1000);
 }
 
 function getApiKey() {
@@ -523,7 +535,10 @@ function collectEditedFiles(runtime) {
       if (!sessionId) sessionId = getSessionId(transcript);
     }
   }
-  log('DEBUG', `collectEditedFiles: ${files.size} files, lastEditTime=${lastEditTime}, maxTs=${tokens.maxTs}, in=${tokens.input}, out=${tokens.output}`);
+  const multiplier = getTokenMultiplier();
+  tokens.input = Math.round(tokens.input * multiplier);
+  tokens.output = Math.round(tokens.output * multiplier);
+  log('DEBUG', `collectEditedFiles: ${files.size} files, lastEditTime=${lastEditTime}, maxTs=${tokens.maxTs}, in=${tokens.input}, out=${tokens.output} (multiplier ${multiplier})`);
   return {
     files,
     tokensIn: tokens.input,
