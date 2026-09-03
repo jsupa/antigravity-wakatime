@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -135,24 +135,30 @@ async function syncAiHeartbeats(cliPath, input) {
   const runtime = getAntigravityRuntime(input);
   const antigravityVersion = await getAntigravityVersion(runtime);
   const plugin = `${runtime.product}/${antigravityVersion || 'unknown'} ${PLUGIN_NAME}/${VERSION}`;
-  const args = ['--sync-ai-activity', '--plugin', plugin];
   const projectFolder = getProjectFolder(input);
 
-  if (projectFolder) args.push('--project-folder', projectFolder);
-
-  log('INFO', `Syncing AI heartbeats: ${formatArguments(cliPath, args)}`);
-
-  try {
-    const result = await execFile(cliPath, args, {
-      windowsHide: true,
-      env: getChildEnv(),
-      timeout: 120000,
-    });
-    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
-    if (output) log('WARN', output);
-    log('INFO', `Synced AI heartbeats using ${plugin}`);
-  } catch (error) {
-    logException('WARN', error);
+  if (runtime === ANTIGRAVITY_CLI) {
+    // The CLI's own Antigravity parser only produces session rows named
+    // "Antigravity CLI <session-uuid>"; this plugin parses the transcripts
+    // itself and posts file rows plus session-scoped tokens, so skip the
+    // redundant sync for CLI runtimes.
+    log('INFO', `Skipping CLI sync, direct posting for ${plugin}`);
+  } else {
+    const args = ['--sync-ai-activity', '--plugin', plugin];
+    if (projectFolder) args.push('--project-folder', projectFolder);
+    log('INFO', `Syncing AI heartbeats: ${formatArguments(cliPath, args)}`);
+    try {
+      const result = await execFile(cliPath, args, {
+        windowsHide: true,
+        env: getChildEnv(),
+        timeout: 120000,
+      });
+      const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+      if (output) log('WARN', output);
+      log('INFO', `Synced AI heartbeats using ${plugin}`);
+    } catch (error) {
+      logException('WARN', error);
+    }
   }
 
   const modelToken = aiModelUserAgentToken(input.modelName || '');
@@ -180,7 +186,7 @@ const API_BASE = process.env.WAKATIME_PLUGIN_API_URL || 'https://wakatime.com/ap
 
 async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelToken) {
   const userAgent = modelToken ? `${modelToken} ${plugin}` : plugin;
-  const { files, tokensIn, tokensOut, maxTimestamp, sessionId } = collectEditedFiles(runtime);
+  const { files, tokensIn, tokensOut, maxTimestamp, sessionId, lastFileEntity } = collectEditedFiles(runtime);
   if (!maxTimestamp) return;
 
   const apiKey = getApiKey();
@@ -190,9 +196,13 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
   }
 
   if (!files.size) {
-    // No new file edits, but (possible) new model activity: post a session
-    // heartbeat so the dashboard token totals keep growing between edits.
-    if (sessionId && tokensIn + tokensOut > 0) {
+    // No new file edits, but new model activity: pin the token delta onto the
+    // most recently edited file (never a "Antigravity CLI <uuid>" entity, so
+    // no session rows clutter the files view). Fall back to an app heartbeat
+    // only if no file is known yet.
+    if (lastFileEntity && tokensIn + tokensOut > 0) {
+      await postFileTokens(apiKey, plugin, userAgent, lastFileEntity, sessionId, tokensIn, tokensOut, maxTimestamp);
+    } else if (sessionId && tokensIn + tokensOut > 0) {
       await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp);
     }
     if (maxTimestamp) saveLastEditTime(maxTimestamp);
@@ -240,6 +250,26 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
   log('INFO', `Posted ${posted} file heartbeats using ${plugin}`);
   if (failed) log('WARN', `${failed} file heartbeats failed to post`);
   if (maxTimestamp) saveLastEditTime(maxTimestamp);
+}
+
+async function postFileTokens(apiKey, plugin, userAgent, entity, sessionId, tokensIn, tokensOut, maxTimestamp) {
+  const payload = {
+    entity,
+    type: 'file',
+    category: 'ai coding',
+    time: Math.round(maxTimestamp / 1000),
+    is_write: true,
+    ai_session: sessionId || undefined,
+    ai_input_tokens: tokensIn,
+    ai_output_tokens: tokensOut,
+    user_agent: userAgent,
+  };
+  try {
+    await postHeartbeat(apiKey, payload);
+    log('INFO', `Posted tokens on ${entity} (in=${tokensIn}, out=${tokensOut}) using ${plugin}`);
+  } catch (error) {
+    logException('WARN', error);
+  }
 }
 
 async function postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp) {
@@ -467,7 +497,7 @@ function collectEditedFiles(runtime) {
   // abs file path -> { timestamp, added, removed, total } for its latest edit,
   // plus token estimates for steps since the watermark.
   const files = new Map();
-  const tokens = { input: 0, output: 0, maxTs: 0 };
+  const tokens = { input: 0, output: 0, maxTs: 0, lastEntity: '', lastEntityTs: 0 };
   let sessionId = '';
   // Only edits after the last sent event are included, otherwise the same
   // lines would be counted once per tool invocation. First run has no
@@ -498,7 +528,14 @@ function collectEditedFiles(runtime) {
     }
   }
   log('DEBUG', `collectEditedFiles: ${files.size} files, lastEditTime=${lastEditTime}, maxTs=${tokens.maxTs}, in=${tokens.input}, out=${tokens.output}`);
-  return { files, tokensIn: tokens.input, tokensOut: tokens.output, maxTimestamp: tokens.maxTs, sessionId };
+  return {
+    files,
+    tokensIn: tokens.input,
+    tokensOut: tokens.output,
+    maxTimestamp: tokens.maxTs,
+    sessionId,
+    lastFileEntity: tokens.lastEntity,
+  };
 }
 
 function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, tokens) {
@@ -570,6 +607,10 @@ function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime, token
       if (!fs.existsSync(absTarget)) {
         log('DEBUG', `Edited file not found, skipping: ${absTarget} (raw: ${String(rawTarget).slice(0, 60)})`);
         continue;
+      }
+      if (timestamp > (tokens.lastEntityTs || 0)) {
+        tokens.lastEntity = absTarget;
+        tokens.lastEntityTs = timestamp;
       }
       const info = editLineChanges(toolCall.args);
       const previous = files.get(absTarget);
