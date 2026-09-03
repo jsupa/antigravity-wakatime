@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -169,6 +169,8 @@ function getBrainDirs(runtime) {
   return [path.join(home, '.gemini', 'antigravity-cli', 'brain')];
 }
 
+const STATE_FILE = 'antigravity-cli-wakatime-state.json';
+
 async function sendEditedFileHeartbeats(cliPath, runtime, plugin, projectFolder) {
   const files = collectEditedFiles(runtime);
   if (!files.size) return;
@@ -177,12 +179,18 @@ async function sendEditedFileHeartbeats(cliPath, runtime, plugin, projectFolder)
   const entities = Array.from(files.entries()).slice(0, MAX_FILE_HEARTBEATS);
   const args = ['--entity', entities[0][0], '--category', 'ai coding', '--plugin', plugin];
   if (projectFolder) args.push('--project-folder', projectFolder);
+  // wakatime-cli's Antigravity parser reports line changes as added - removed
+  // for a file heartbeat; mirror that with --ai-line-changes.
+  args.push('--ai-line-changes', String(entities[0][1].added - entities[0][1].removed));
 
-  const extras = entities.slice(1).map(([entity, timestamp]) => ({
+  const extras = entities.slice(1).map(([entity, info]) => ({
     entity,
     category: 'ai coding',
-    timestamp: Math.round(timestamp / 1000),
-    time: Math.round(timestamp / 1000),
+    timestamp: Math.round(info.timestamp / 1000),
+    time: Math.round(info.timestamp / 1000),
+    ai_line_changes: info.added - info.removed,
+    lines: info.total,
+    is_write: true,
   }));
   if (extras.length) args.push('--extra-heartbeats');
 
@@ -192,14 +200,39 @@ async function sendEditedFileHeartbeats(cliPath, runtime, plugin, projectFolder)
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
     if (output) log('WARN', output);
     log('INFO', `Sent ${entities.length} file heartbeats using ${plugin}`);
+    saveLastEditTime(files);
   } catch (error) {
     logException('WARN', error);
   }
 }
 
+function getLastEditTime() {
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(getWakatimeDir(), STATE_FILE), 'utf8'));
+    return state.lastEditTimeMillis || 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function saveLastEditTime(files) {
+  try {
+    let last = 0;
+    for (const [, info] of files) if (info.timestamp > last) last = info.timestamp;
+    if (!last) return;
+    fs.writeFileSync(path.join(getWakatimeDir(), STATE_FILE), JSON.stringify({ lastEditTimeMillis: last }));
+    log('DEBUG', `Saved edit watermark ${last}`);
+  } catch (_) {}
+}
+
 function collectEditedFiles(runtime) {
-  // abs file path -> epoch millis of the latest edit (from created_at).
+  // abs file path -> { timestamp, added, removed, total } for its latest edit.
   const files = new Map();
+  // Only edits after the last sent event are included, otherwise the same
+  // lines would be counted once per tool invocation. First run has no
+  // watermark: start clean at now instead of replaying the whole session.
+  let lastEditTime = getLastEditTime();
+  if (!lastEditTime) lastEditTime = Date.now();
   for (const brainDir of getBrainDirs(runtime)) {
     let sessionDirs;
     try {
@@ -219,13 +252,13 @@ function collectEditedFiles(runtime) {
     // newest ones to keep per-event latency bounded (the hook timeout is 5s).
     transcripts.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
     for (const transcript of transcripts.slice(0, MAX_TRANSCRIPTS_TO_SCAN)) {
-      scanTranscriptForEditedFiles(transcript, files);
+      scanTranscriptForEditedFiles(transcript, files, lastEditTime);
     }
   }
   return files;
 }
 
-function scanTranscriptForEditedFiles(transcriptPath, files) {
+function scanTranscriptForEditedFiles(transcriptPath, files, lastEditTime) {
   // wakatime-cli's own Antigravity parser only creates file heartbeats from
   // "CODE_ACTION" transcript lines, which this Antigravity CLI build never
   // writes: it records edits as tool_calls (e.g. replace_file_content or
@@ -263,6 +296,8 @@ function scanTranscriptForEditedFiles(transcriptPath, files) {
     }
     if (!Array.isArray(entry.tool_calls)) continue;
     const timestamp = Date.parse(entry.created_at || '');
+    if (!Number.isFinite(timestamp)) continue;
+    if (timestamp <= lastEditTime) continue; // only new edits since last event
     for (const toolCall of entry.tool_calls) {
       if (!toolCall || !FILE_TOOL_NAMES.has(toolCall.name)) continue;
       // Transcript arg values are JSON-encoded strings: the real path
@@ -274,12 +309,72 @@ function scanTranscriptForEditedFiles(transcriptPath, files) {
       if (typeof target !== 'string' || !target.trim()) continue;
       const absTarget = path.resolve(target);
       if (!fs.existsSync(absTarget)) continue; // deleted files are not tracked
+      const info = editLineChanges(toolCall.args);
       const previous = files.get(absTarget);
-      if (previous === undefined || (Number.isFinite(timestamp) && timestamp > previous)) {
-        files.set(absTarget, Number.isFinite(timestamp) ? timestamp : 0);
+      if (previous === undefined || timestamp > previous.timestamp) {
+        files.set(absTarget, { timestamp, ...info });
       }
     }
   }
+}
+
+function editLineChanges(args) {
+  if (!args) return { added: 0, removed: 0, total: 0 };
+  const before = decodeContentString(args.TargetContent);
+  const after = decodeContentString(args.ReplacementContent || args.CodeContent || '');
+  let total = countNewlines(after);
+  if (before === '' && after === '') return { added: total, removed: 0, total };
+  const changes = diffLineCounts(before, after);
+  return { added: changes.added, removed: changes.removed, total };
+}
+
+function countNewlines(text) {
+  if (!text) return 0;
+  return text.split('\n').filter((line) => line.trim() !== '').length;
+}
+
+// Counts added/removed lines between two texts using a classic LCS line diff.
+// Falls back to the length delta for very large inputs.
+function diffLineCounts(before, after) {
+  const oldLines = before.split('\n');
+  const newLines = after.split('\n');
+  const n = oldLines.length;
+  const m = newLines.length;
+
+  if (n === 0) return { added: countNewlines(after), removed: 0 };
+  if (m === 0) return { added: 0, removed: countNewlines(before) };
+  if (n * m > 1500 * 1500) {
+    return {
+      added: Math.max(0, countNewlines(after) - countNewlines(before)),
+      removed: Math.max(0, countNewlines(before) - countNewlines(after)),
+    };
+  }
+
+  // lcs[i][j] = length of longest common subsequence of oldLines[0..i), newLines[0..j)
+  const lcs = new Int32Array((n + 1) * (m + 1));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) lcs[i * (m + 1) + j] = lcs[(i - 1) * (m + 1) + j - 1] + 1;
+      else lcs[i * (m + 1) + j] = Math.max(lcs[(i - 1) * (m + 1) + j], lcs[i * (m + 1) + j - 1]);
+    }
+  }
+  return { added: m - lcs[n * (m + 1) + m], removed: n - lcs[n * (m + 1) + m] };
+}
+
+function decodeContentString(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (_) {
+      // The transcript stores content as a JSON-encoded string, but a stray
+      // raw newline can make strict parsing fail; unescape manually instead.
+      // eslint-disable-next-line no-control-regex
+      return trimmed.slice(1, -1).replace(/\\(["\\/bfnrt])/g, (match, ch) => ({ b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' }[ch] ?? ch));
+    }
+  }
+  return value;
 }
 
 function decodeArgString(value) {
