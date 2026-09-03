@@ -29,6 +29,11 @@ async function main() {
     return;
   }
 
+  if (process.env.WAKATIME_PLUGIN_BACKFILL === '1') {
+    await runBackfill();
+    return;
+  }
+
   const input = readInput();
   if (!input) return;
 
@@ -261,6 +266,81 @@ function getRuntimeDisplayName(runtime) {
   if (runtime === ANTIGRAVITY_IDE) return 'Antigravity IDE';
   if (runtime === ANTIGRAVITY_DESKTOP) return 'Antigravity';
   return 'Antigravity CLI';
+}
+
+// One-time backfill of token estimates for older sessions. Trigger with
+// WAKATIME_PLUGIN_BACKFILL=1; does not touch the live watermark.
+async function runBackfill() {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    log('WARN', 'No api_key in ~/.wakatime.cfg; backfill aborted');
+    return;
+  }
+  const plugin = `${PLUGIN_NAME}/${VERSION}`;
+  const transcripts = [];
+  for (const runtime of [ANTIGRAVITY_CLI, ANTIGRAVITY_IDE, ANTIGRAVITY_DESKTOP]) {
+    for (const brainDir of getBrainDirs(runtime)) {
+      let sessionDirs;
+      try {
+        sessionDirs = fs.readdirSync(brainDir);
+      } catch (_) {
+        continue;
+      }
+      for (const sessionDir of sessionDirs) {
+        const transcript = path.join(brainDir, sessionDir, '.system_generated', 'logs', 'transcript.jsonl');
+        if (fs.existsSync(transcript)) transcripts.push(transcript);
+      }
+    }
+  }
+  transcripts.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+
+  let posted = 0;
+  for (const transcript of transcripts.slice(0, 25)) {
+    const tokens = { input: 0, output: 0, maxTs: 0 };
+    let modelToken = '';
+    try {
+      const lines = fs.readFileSync(transcript, 'utf8').split('\n');
+      for (const line of lines) {
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch (_) {
+          continue;
+        }
+        const timestamp = Date.parse(entry.created_at || '');
+        if (Number.isFinite(timestamp) && timestamp > tokens.maxTs) tokens.maxTs = timestamp;
+        if (!modelToken) modelToken = modelTokenForEntry(entry);
+        if (entry.source === 'USER_EXPLICIT' || (entry.source === 'MODEL' && entry.type === 'GENERIC')) {
+          tokens.input += estimateTokens(entry.content);
+        } else if (entry.source === 'MODEL' && entry.type !== 'CHECKPOINT') {
+          tokens.output += estimateTokens(
+            `${entry.thinking || ''}${entry.content || ''}${entry.tool_calls ? JSON.stringify(entry.tool_calls) : ''}`,
+          );
+        }
+      }
+    } catch (_) {
+      continue;
+    }
+    if (!tokens.maxTs) continue;
+    const sessionId = getSessionId(transcript);
+    if (tokens.input + tokens.output < 500) continue; // skip trivial sessions
+    const userAgent = modelToken ? `${modelToken} ${plugin}` : plugin;
+    await postSessionHeartbeat(
+      apiKey, ANTIGRAVITY_CLI, plugin, userAgent, sessionId, tokens.input, tokens.output, tokens.maxTs,
+    );
+    posted++;
+  }
+  log('INFO', `Backfill posted ${posted} session heartbeats`);
+}
+
+function modelTokenForEntry(entry) {
+  // "The user changed setting `Model Selection` from None to Gemini 3.8 Flash (High)."
+  const match = String(entry.content || '').match(/Model Selection[^\n]*?\bto\s+([^\n(]+)(?:\s*\(([^)]*)\))?/);
+  if (!match) return '';
+  const name = String(match[1]).trim().replace(/[.:]$/, '');
+  if (!/\d/.test(name)) return '';
+  const complexity = String(match[2] || '').trim().toLowerCase();
+  return aiModelUserAgentToken(name, complexity);
 }
 
 function getApiKey() {
