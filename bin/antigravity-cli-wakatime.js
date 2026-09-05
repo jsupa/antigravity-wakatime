@@ -10,7 +10,7 @@ const path = require('path');
 const tls = require('tls');
 const zlib = require('zlib');
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const PLUGIN_NAME = 'antigravity-cli-wakatime';
 const GITHUB_DOWNLOAD_URL = 'https://github.com/wakatime/wakatime-cli/releases/latest/download';
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/wakatime/wakatime-cli/releases/latest';
@@ -31,6 +31,14 @@ async function main() {
 
   if (process.env.WAKATIME_PLUGIN_BACKFILL === '1') {
     await runBackfill();
+    return;
+  }
+
+  if (process.argv.includes('--real-tokens')) {
+    await null; // main() runs during module load; defer past const TDZ.
+    log('INFO', JSON.stringify(collectConversationTokens().map((s) => ({
+      session: s.id.slice(0, 8), input: s.input, cached: s.cacheRead, output: s.output,
+    }))));
     return;
   }
 
@@ -195,14 +203,19 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
     return;
   }
 
+  // Token Monitor's calculation takes over for CLI sessions: real per-generation
+  // counts from the conversation DBs replace the estimate deltas below (file rows
+  // still post their own lines). See postRealSessionTokens / collectConversationTokens.
+  const postedReal = await postRealSessionTokens(apiKey, runtime, plugin, userAgent);
+
   if (!files.size) {
     // No new file edits, but new model activity: pin the token delta onto the
     // most recently edited file (never a "Antigravity CLI <uuid>" entity, so
     // no session rows clutter the files view). Fall back to an app heartbeat
     // only if no file is known yet.
-    if (lastFileEntity && tokensIn + tokensOut > 0) {
+    if (!postedReal && lastFileEntity && tokensIn + tokensOut > 0) {
       await postFileTokens(apiKey, plugin, userAgent, lastFileEntity, sessionId, tokensIn, tokensOut, maxTimestamp);
-    } else if (sessionId && tokensIn + tokensOut > 0) {
+    } else if (!postedReal && sessionId && tokensIn + tokensOut > 0) {
       await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp);
     }
     if (maxTimestamp) saveLastEditTime(maxTimestamp);
@@ -242,7 +255,7 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
   if (failed) log('WARN', `${failed} file heartbeats failed to post`);
   // Tokens live on the session's app row (exactly where wakatime-cli's own
   // adapters put them); file rows carry lines and real paths only.
-  if (sessionId && tokensIn + tokensOut > 0) {
+  if (!postedReal && sessionId && tokensIn + tokensOut > 0) {
     await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp);
   }
   if (maxTimestamp) saveLastEditTime(maxTimestamp);
@@ -268,7 +281,7 @@ async function postFileTokens(apiKey, plugin, userAgent, entity, sessionId, toke
   }
 }
 
-async function postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp) {
+async function postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionId, tokensIn, tokensOut, maxTimestamp, cachedTokens) {
   const payload = {
     entity: `${getRuntimeDisplayName(runtime)} ${sessionId}`,
     type: 'app',
@@ -277,6 +290,7 @@ async function postSessionHeartbeat(apiKey, runtime, plugin, userAgent, sessionI
     is_write: true,
     ai_session: sessionId,
     ai_input_tokens: tokensIn,
+    ai_cached_input_tokens: cachedTokens || 0,
     ai_output_tokens: tokensOut,
     user_agent: userAgent,
   };
@@ -484,21 +498,210 @@ function getSessionId(transcriptPath) {
   return path.basename(path.dirname(path.dirname(path.dirname(transcriptPath))));
 }
 
-function getLastEditTime() {
+function readPluginState() {
   try {
-    const state = JSON.parse(fs.readFileSync(path.join(getWakatimeDir(), STATE_FILE), 'utf8'));
-    return state.lastEditTimeMillis || 0;
+    return JSON.parse(fs.readFileSync(path.join(getWakatimeDir(), STATE_FILE), 'utf8'));
   } catch (_) {
-    return 0;
+    return {};
   }
+}
+
+function savePluginState(patch) {
+  try {
+    const current = readPluginState();
+    fs.writeFileSync(path.join(getWakatimeDir(), STATE_FILE), JSON.stringify({ ...current, ...patch }));
+  } catch (_) {}
+}
+
+function getLastEditTime() {
+  return readPluginState().lastEditTimeMillis || 0;
 }
 
 function saveLastEditTime(timestamp) {
   try {
     if (!timestamp) return;
-    fs.writeFileSync(path.join(getWakatimeDir(), STATE_FILE), JSON.stringify({ lastEditTimeMillis: timestamp }));
+    savePluginState({ lastEditTimeMillis: timestamp });
     log('DEBUG', `Saved edit watermark ${timestamp}`);
   } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Real per-generation token counts (Token Monitor's calculation).
+//
+// Antigravity CLI persists each generation's usage as a protobuf blob in its
+// conversation SQLite DBs (~/.gemini/antigravity-cli/conversations/<uuid>.db,
+// gen_metadata table). The wire layout below is reverse-engineered and
+// cross-checked against Javis603/tokscale
+// (crates/tokscale-core/src/sessions/antigravity_cli.rs): blob f1 = chatModel
+// (f19 responseModel, f21 display label, f9.f4 = wall-clock Timestamp),
+// blob f4 = usage (f1 fixed system-prompt tokens, f2 non-cached input,
+// f5 cacheRead, f9 output, f10 reasoning, f11 responseId dedup key). These are
+// exact counts, unlike the chars/4 estimates below which remain only as a
+// fallback for runtimes that persist no usage numbers.
+
+function protoFields(buf) {
+  const fields = {};
+  let i = 0;
+  while (i < buf.length) {
+    let key = 0;
+    let shift = 0;
+    let b;
+    do {
+      b = buf[i++];
+      key += (b & 0x7f) * Math.pow(2, shift);
+      shift += 7;
+    } while (b & 0x80 && i < buf.length);
+    const fieldNum = key >>> 3;
+    const wireType = key & 7;
+    if (!fieldNum) break;
+    if (wireType === 0) {
+      let value = 0;
+      let s = 0;
+      do {
+        b = buf[i++];
+        value += (b & 0x7f) * Math.pow(2, s);
+        s += 7;
+      } while (b & 0x80 && i < buf.length);
+      fields[fieldNum] = { type: 0, value };
+    } else if (wireType === 2) {
+      let len = 0;
+      let s = 0;
+      do {
+        b = buf[i++];
+        len += (b & 0x7f) * Math.pow(2, s);
+        s += 7;
+      } while (b & 0x80 && i < buf.length);
+      fields[fieldNum] = { type: 2, bytes: buf.slice(i, i + len) };
+      i += len;
+    } else {
+      i += wireType === 1 ? 8 : 4;
+    }
+  }
+  return fields;
+}
+
+function fieldBytes(fields, n) {
+  const f = fields[n];
+  return f && f.type === 2 ? f.bytes : null;
+}
+
+function fieldVarint(fields, n) {
+  const f = fields[n];
+  return f && f.type === 0 ? f.value : 0;
+}
+
+function parseConversationDb(dbPath) {
+  const out = childProcess.execFileSync('sqlite3', [dbPath, 'SELECT idx, quote(data) FROM gen_metadata ORDER BY idx;'], {
+    timeout: 5000,
+    encoding: 'utf8',
+    maxBuffer: 128 * 1024 * 1024,
+  });
+  const gens = [];
+  for (const line of out.split('\n')) {
+    // sqlite3 list output: `<idx>|X'<hex>'`; dedupe malformed rows quietly.
+    const m = /^(\d+)\s*\|\s*([xX]'[0-9a-fA-F]*')$/.exec(line.trim());
+    if (!m) continue;
+    const idx = Number(m[1]);
+    const blob = Buffer.from(m[2].slice(2).replace(/'$/, ''), 'hex');
+    const top = protoFields(blob);
+    const chatModelBytes = fieldBytes(top, 1);
+    if (!chatModelBytes) continue;
+    const chatModel = protoFields(chatModelBytes);
+    // usage lives on the chatModel message (#4); older builds read it from
+    // the blob's own #4 — try chatModel first, then the blob-level fallback.
+    const usageBytes = fieldBytes(chatModel, 4) || fieldBytes(top, 4);
+    if (!usageBytes) continue;
+    const usage = protoFields(usageBytes);
+    const input = fieldVarint(usage, 1) + fieldVarint(usage, 2);
+    const cacheRead = fieldVarint(usage, 5);
+    const output = fieldVarint(usage, 9);
+    const reasoning = fieldVarint(usage, 10);
+    if (!(input || cacheRead || output || reasoning)) continue;
+    const dedupBytes = fieldBytes(usage, 11);
+    gens.push({
+      idx,
+      input,
+      cacheRead,
+      output: output + reasoning,
+      dedup: dedupBytes ? dedupBytes.toString() : '',
+    });
+  }
+  return gens;
+}
+
+function collectConversationTokens() {
+  const dir = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
+  const state = readPluginState();
+  // Tokens are counted by generation index per session, so entries already
+  // posted are never re-counted; the heartbeat time comes from the DB mtime
+  // (updated on every write). First run posts the whole history seeded back to
+  // 3 days so today's totals reach WakaTime once, like Token Monitor shows.
+  const idxWatermarks = state.conversationIdx || {};
+  const firstRun = state.conversationInitialized !== true;
+  const sessions = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(dir)
+      .filter((n) => n.endsWith('.db'))
+      .sort((a, b) => fs.statSync(path.join(dir, b)).mtimeMs - fs.statSync(path.join(dir, a)).mtimeMs);
+  } catch (err) {
+    log('DEBUG', `conversations dir unreadable: ${err.message}`);
+    return sessions;
+  }
+  log('DEBUG', `conversation dbs: ${names.length} (${dir})`);
+  for (const name of names.slice(0, MAX_TRANSCRIPTS_TO_SCAN)) {
+    const id = name.replace(/\.db$/, '');
+    const dbPath = path.join(dir, name);
+    let gens;
+    try {
+      gens = parseConversationDb(dbPath);
+    } catch (err) {
+      log('DEBUG', `parseConversationDb ${name}: ${err.message}`);
+      continue;
+    }
+    const lastIdx = firstRun ? -1 : (idxWatermarks[id] || 0);
+    const seen = new Set();
+    let input = 0;
+    let cacheRead = 0;
+    let output = 0;
+    let maxIdx = lastIdx;
+    for (const g of gens) {
+      if (g.idx <= lastIdx) continue;
+      if (g.dedup && seen.has(g.dedup)) continue;
+      if (g.dedup) seen.add(g.dedup);
+      input += g.input;
+      cacheRead += g.cacheRead;
+      output += g.output;
+      maxIdx = Math.max(maxIdx, g.idx);
+    }
+    if (maxIdx === lastIdx) continue;
+    let maxTs;
+    try {
+      maxTs = fs.statSync(dbPath).mtimeMs;
+    } catch (_) {
+      continue;
+    }
+    sessions.push({ id, input, cacheRead, output, maxTs, maxIdx });
+  }
+  return sessions;
+}
+
+function saveConversationTokensState(sessions) {
+  const idx = { ...(readPluginState().conversationIdx || {}) };
+  for (const s of sessions) idx[s.id] = s.maxIdx;
+  savePluginState({ conversationInitialized: true, conversationIdx: idx });
+}
+
+async function postRealSessionTokens(apiKey, runtime, plugin, userAgent) {
+  if (runtime !== ANTIGRAVITY_CLI) return false;
+  const sessions = collectConversationTokens();
+  if (!sessions.length) return false;
+  for (const s of sessions) {
+    await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, s.id, s.input, s.output, s.maxTs, s.cacheRead);
+  }
+  saveConversationTokensState(sessions);
+  log('INFO', `Posted real conversation tokens (${sessions.length} sessions) using ${plugin}`);
+  return true;
 }
 
 function collectEditedFiles(runtime) {
