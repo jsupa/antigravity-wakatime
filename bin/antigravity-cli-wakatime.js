@@ -618,12 +618,14 @@ function parseConversationDb(dbPath) {
     const reasoning = fieldVarint(usage, 10);
     if (!(input || cacheRead || output || reasoning)) continue;
     const dedupBytes = fieldBytes(usage, 11);
+    const modelBytes = fieldBytes(chatModel, 19) || fieldBytes(chatModel, 21);
     gens.push({
       idx,
       input,
       cacheRead,
       output: output + reasoning,
       dedup: dedupBytes ? dedupBytes.toString() : '',
+      model: modelBytes ? modelBytes.toString() : '',
     });
   }
   return gens;
@@ -665,6 +667,7 @@ function collectConversationTokens() {
     let cacheRead = 0;
     let output = 0;
     let maxIdx = lastIdx;
+    let model = '';
     for (const g of gens) {
       if (g.idx <= lastIdx) continue;
       if (g.dedup && seen.has(g.dedup)) continue;
@@ -673,6 +676,7 @@ function collectConversationTokens() {
       cacheRead += g.cacheRead;
       output += g.output;
       maxIdx = Math.max(maxIdx, g.idx);
+      if (g.model) model = g.model;
     }
     if (maxIdx === lastIdx) continue;
     let maxTs;
@@ -681,7 +685,7 @@ function collectConversationTokens() {
     } catch (_) {
       continue;
     }
-    sessions.push({ id, input, cacheRead, output, maxTs, maxIdx });
+    sessions.push({ id, input, cacheRead, output, maxTs, maxIdx, model });
   }
   return sessions;
 }
@@ -697,7 +701,10 @@ async function postRealSessionTokens(apiKey, runtime, plugin, userAgent) {
   const sessions = collectConversationTokens();
   if (!sessions.length) return false;
   for (const s of sessions) {
-    await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, s.id, s.input, s.output, s.maxTs, s.cacheRead);
+    // Model attribution is what WakaTime prices against — prefer the machine
+    // id persisted in the conversation (#19/#21) over the hook-input guess.
+    const sessionAgent = s.model ? `${aiModelUserAgentToken(s.model, '')} ${plugin}`.trim() : userAgent;
+    await postSessionHeartbeat(apiKey, runtime, plugin, sessionAgent, s.id, s.input, s.output, s.maxTs, s.cacheRead);
   }
   saveConversationTokensState(sessions);
   log('INFO', `Posted real conversation tokens (${sessions.length} sessions) using ${plugin}`);
