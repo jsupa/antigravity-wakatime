@@ -686,14 +686,6 @@ function collectConversationTokens() {
     } catch (_) {
       continue;
     }
-    // User calibration: ai_token_multiplier in ~/.wakatime.cfg (default 1)
-    // scales the real counts so the reported numbers line up with provider
-    // billing. Cumulative rows make this a pure refresh — the next post
-    // replaces the row with the scaled total.
-    const multiplier = getTokenMultiplier();
-    input = Math.round(input * multiplier);
-    cacheRead = Math.round(cacheRead * multiplier);
-    output = Math.round(output * multiplier);
     sessions.push({ id, input, cacheRead, output, maxTs, model });
   }
   return sessions;
