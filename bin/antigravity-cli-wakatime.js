@@ -661,38 +661,39 @@ function collectConversationTokens() {
       log('DEBUG', `parseConversationDb ${name}: ${err.message}`);
       continue;
     }
-    const lastIdx = firstRun ? -1 : (idxWatermarks[id] || 0);
+    // Cumulative totals every run: WakaTime keeps the last heartbeat per
+    // (entity, time), so these posts REPLACE each other rather than stack or
+    // lose deltas. The per-session row always carries the current total.
     const seen = new Set();
     let input = 0;
     let cacheRead = 0;
     let output = 0;
-    let maxIdx = lastIdx;
     let model = '';
     for (const g of gens) {
-      if (g.idx <= lastIdx) continue;
       if (g.dedup && seen.has(g.dedup)) continue;
       if (g.dedup) seen.add(g.dedup);
       input += g.input;
       cacheRead += g.cacheRead;
       output += g.output;
-      maxIdx = Math.max(maxIdx, g.idx);
       if (g.model) model = g.model;
     }
-    if (maxIdx === lastIdx) continue;
     let maxTs;
     try {
-      maxTs = fs.statSync(dbPath).mtimeMs;
+      // Stable row key: the conversation DB's birth time never changes, so
+      // consecutive posts replace one row instead of minting new ones per edit.
+      const st = fs.statSync(dbPath);
+      maxTs = st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs;
     } catch (_) {
       continue;
     }
-    sessions.push({ id, input, cacheRead, output, maxTs, maxIdx, model });
+    sessions.push({ id, input, cacheRead, output, maxTs, model });
   }
   return sessions;
 }
 
 function saveConversationTokensState(sessions) {
   const idx = { ...(readPluginState().conversationIdx || {}) };
-  for (const s of sessions) idx[s.id] = s.maxIdx;
+  for (const s of sessions) idx[s.id] = s.maxTs;
   savePluginState({ conversationInitialized: true, conversationIdx: idx });
 }
 
