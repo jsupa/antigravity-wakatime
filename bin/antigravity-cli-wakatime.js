@@ -34,6 +34,22 @@ async function main() {
     return;
   }
 
+  if (process.argv.includes('--seed-watermark')) {
+    await null; // main() runs during module load; defer past const TDZ.
+    const dir = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    const idx = {};
+    for (const name of fs.readdirSync(dir).filter((n) => n.endsWith('.db'))) {
+      let gens = [];
+      try {
+        gens = parseConversationDb(path.join(dir, name));
+      } catch (_) {}
+      idx[name.replace(/\.db$/, '')] = gens.reduce((m, g) => Math.max(m, g.idx), 0);
+    }
+    savePluginState({ conversationPostedIdx: idx });
+    log('INFO', `Seeded conversation watermarks for ${Object.keys(idx).length} sessions`);
+    return;
+  }
+
   if (process.argv.includes('--real-tokens')) {
     await null; // main() runs during module load; defer past const TDZ.
     log('INFO', JSON.stringify(collectConversationTokens().map((s) => ({
@@ -151,7 +167,7 @@ async function syncAiHeartbeats(cliPath, input) {
     // itself and posts file rows plus session-scoped tokens, so skip the
     // redundant sync for CLI runtimes.
     log('INFO', `Skipping CLI sync, direct posting for ${plugin}`);
-  } else {
+  } else if (process.env.WAKATIME_ALLOW_CLI_SYNC === '1') {
     const args = ['--sync-ai-activity', '--plugin', plugin];
     if (projectFolder) args.push('--project-folder', projectFolder);
     log('INFO', `Syncing AI heartbeats: ${formatArguments(cliPath, args)}`);
@@ -233,8 +249,8 @@ async function sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelTok
       category: 'ai coding',
       time: Math.round(info.timestamp / 1000),
       is_write: true,
-      lines: info.total,
-      ai_line_changes: info.added - info.removed,
+      lines: Math.round(info.total * getLinesMultiplier()),
+      ai_line_changes: Math.round((info.added - info.removed) * getLinesMultiplier()),
       // The user_agent carries the model token (e.g. gemini/3.8-flash-high);
       // the server parses it into ai_model / ai_model_version, which is what
       // powers WakaTime's model-specific token breakdowns.
@@ -393,6 +409,13 @@ function getTokenMultiplier() {
   const value = Number(getSetting('settings', 'ai_token_multiplier'));
   if (!Number.isFinite(value) || value <= 0) return 1;
   return Math.min(value, 1000);
+}
+
+function getLinesMultiplier() {
+  // User calibration for the lines view, mirroring ai_token_multiplier.
+  const value = Number(getSetting('settings', 'ai_lines_multiplier'));
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  return Math.min(value, 100);
 }
 
 function getApiKey() {
@@ -638,8 +661,9 @@ function collectConversationTokens() {
   // posted are never re-counted; the heartbeat time comes from the DB mtime
   // (updated on every write). First run posts the whole history seeded back to
   // 3 days so today's totals reach WakaTime once, like Token Monitor shows.
-  const idxWatermarks = state.conversationIdx || {};
-  const firstRun = state.conversationInitialized !== true;
+  // Only generations past the last successfully posted index are new; the
+  // watermark advances in saveConversationTokensState after a successful post.
+  const postedIdx = state.conversationPostedIdx || {};
   const sessions = [];
   let names = [];
   try {
@@ -661,40 +685,39 @@ function collectConversationTokens() {
       log('DEBUG', `parseConversationDb ${name}: ${err.message}`);
       continue;
     }
-    // Cumulative totals every run: WakaTime keeps the last heartbeat per
-    // (entity, time), so these posts REPLACE each other rather than stack or
-    // lose deltas. The per-session row always carries the current total.
+    // Deltas only, exactly once: WakaTime APPENDS every POST as a row and sums
+    // the day, so re-posting a running total multiplies it (an ~800x inflation
+    // came from exactly that). Count only generations past the last posted
+    // index; the watermark advances after a successful post.
+    const lastIdx = postedIdx[id] || 0;
     const seen = new Set();
     let input = 0;
     let cacheRead = 0;
     let output = 0;
     let model = '';
+    let maxIdx = lastIdx;
     for (const g of gens) {
+      if (g.idx <= lastIdx) continue;
       if (g.dedup && seen.has(g.dedup)) continue;
       if (g.dedup) seen.add(g.dedup);
       input += g.input;
       cacheRead += g.cacheRead;
       output += g.output;
+      maxIdx = Math.max(maxIdx, g.idx);
       if (g.model) model = g.model;
     }
-    let maxTs;
-    try {
-      // Stable row key: the conversation DB's birth time never changes, so
-      // consecutive posts replace one row instead of minting new ones per edit.
-      const st = fs.statSync(dbPath);
-      maxTs = st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs;
-    } catch (_) {
-      continue;
-    }
-    sessions.push({ id, input, cacheRead, output, maxTs, model });
+    if (maxIdx === lastIdx) continue;
+    // Unique per post: the row time is "now", never a repeated watermark stamp.
+    const maxTs = Date.now();
+    sessions.push({ id, input, cacheRead, output, maxTs, maxIdx, model });
   }
   return sessions;
 }
 
 function saveConversationTokensState(sessions) {
-  const idx = { ...(readPluginState().conversationIdx || {}) };
-  for (const s of sessions) idx[s.id] = s.maxTs;
-  savePluginState({ conversationInitialized: true, conversationIdx: idx });
+  const idx = { ...(readPluginState().conversationPostedIdx || {}) };
+  for (const s of sessions) idx[s.id] = s.maxIdx;
+  savePluginState({ conversationPostedIdx: idx });
 }
 
 async function postRealSessionTokens(apiKey, runtime, plugin, userAgent) {
