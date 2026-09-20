@@ -702,7 +702,13 @@ function collectConversationTokens() {
     // the day, so re-posting a running total multiplies it (an ~800x inflation
     // came from exactly that). Count only generations past the last posted
     // index; the watermark advances after a successful post.
-    const lastIdx = postedIdx[id] || 0;
+    //
+    // A session with no watermark is ADOPTED at its current tip rather than
+    // counted from zero: a first sighting must never dump the conversation's
+    // whole history into one day (186M tokens arrived that way once).
+    const gensMax = gens.reduce((m, g) => Math.max(m, g.idx), 0);
+    const known = Object.prototype.hasOwnProperty.call(postedIdx, id);
+    const lastIdx = known ? postedIdx[id] : gensMax;
     const seen = new Set();
     let input = 0;
     let cacheRead = 0;
@@ -719,7 +725,7 @@ function collectConversationTokens() {
       maxIdx = Math.max(maxIdx, g.idx);
       if (g.model) model = g.model;
     }
-    if (maxIdx === lastIdx) continue;
+    if (maxIdx === lastIdx && known) continue;
     // Unique per post: the row time is "now", never a repeated watermark stamp.
     const maxTs = Date.now();
     sessions.push({ id, input, cacheRead, output, maxTs, maxIdx, model });
@@ -794,10 +800,12 @@ async function applyDailyTarget(apiKey, runtime, plugin, userAgent) {
   const gap = desired - current;
   if (gap <= 0) return;
   const lastTopUp = state.dailyTopUpTs || 0;
-  if (lastTopUp && Date.now() - lastTopUp < 30 * 60 * 1000) return;
-  const payloadTs = Date.now();
-  await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, `daily-target-${today}`, gap, 0, payloadTs, 0);
-  savePluginState({ dailyTopUpTs: payloadTs });
+  const now = Date.now();
+  if (lastTopUp && now - lastTopUp < 30 * 60 * 1000) return;
+  // Claim the slot BEFORE posting: two concurrent hook runs would otherwise
+  // both read the old timestamp and each post the whole gap (a 146M double-post).
+  savePluginState({ dailyTopUpTs: now });
+  await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, `daily-target-${today}`, gap, 0, now, 0);
   log('INFO', `Daily calibration: posted ${gap} tokens (measured ${state.dailyMeasured || 0}, reported ${current}, target ${desired})`);
 }
 
@@ -809,6 +817,8 @@ async function postRealSessionTokens(apiKey, runtime, plugin, userAgent) {
   const state = readPluginState();
   let measured = state.dailyDate === today ? (state.dailyMeasured || 0) : 0;
   for (const s of sessions) {
+    // Adopted sessions carry no tokens; they only record a watermark.
+    if (s.input + s.cacheRead + s.output <= 0) continue;
     // Model attribution is what WakaTime prices against — prefer the machine
     // id persisted in the conversation (#19/#21) over the hook-input guess.
     const sessionAgent = s.model ? `${aiModelUserAgentToken(s.model, '')} ${plugin}`.trim() : userAgent;
