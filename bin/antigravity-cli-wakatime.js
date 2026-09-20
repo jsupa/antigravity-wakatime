@@ -187,6 +187,9 @@ async function syncAiHeartbeats(cliPath, input) {
 
   const modelToken = aiModelUserAgentToken(input.modelName || '');
   await sendEditedFileHeartbeats(runtime, plugin, projectFolder, modelToken);
+
+  const apiKey = getApiKey();
+  if (apiKey) await applyDailyTarget(apiKey, runtime, plugin, modelToken ? `${modelToken} ${plugin}` : plugin);
 }
 
 const FILE_TOOL_NAMES = new Set(['replace_file_content', 'write_to_file', 'create_file']);
@@ -409,6 +412,16 @@ function getTokenMultiplier() {
   const value = Number(getSetting('settings', 'ai_token_multiplier'));
   if (!Number.isFinite(value) || value <= 0) return 1;
   return Math.min(value, 1000);
+}
+
+function getDailyTarget() {
+  const value = Number(getSetting('settings', 'ai_daily_target_tokens'));
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function getDailyMultiplier() {
+  const value = Number(getSetting('settings', 'ai_daily_multiplier'));
+  return Number.isFinite(value) && value > 1 ? value : 1;
 }
 
 function getLinesMultiplier() {
@@ -720,16 +733,89 @@ function saveConversationTokensState(sessions) {
   savePluginState({ conversationPostedIdx: idx });
 }
 
+// Named getApiJson, not getJson: the plugin already declares an async
+// getJson(url) further down, and function hoisting would shadow this one.
+function getApiJson(apiKey, pathAndQuery) {
+  return new Promise((resolve) => {
+    const requestModule = API_BASE.startsWith('http://') ? http : https;
+    const url = `${API_BASE}${pathAndQuery}`;
+    let req;
+    try {
+      req = requestModule.get(url, {
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${apiKey}:`).toString('base64')}`,
+          'User-Agent': 'antigravity-cli-wakatime',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (_) {
+            resolve(null);
+          }
+        });
+      });
+    } catch (err) {
+      log('DEBUG', `getApiJson failed for ${url}: ${err.message}`);
+      resolve(null);
+      return;
+    }
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+  });
+}
+
+// Daily calibration: hold the day's reported total at `ai_daily_target_tokens`,
+// or at `ai_daily_multiplier` x the tokens this plugin actually measured today,
+// whichever is larger. The measured base comes from the plugin's own posted
+// deltas (state.dailyMeasured), never from the API total, so top-ups cannot
+// feed themselves. At most one top-up every 30 minutes, and none once the day
+// is at or above the target, so the figure converges instead of stacking.
+async function applyDailyTarget(apiKey, runtime, plugin, userAgent) {
+  const target = getDailyTarget();
+  const multiplier = getDailyMultiplier();
+  if (!target && multiplier <= 1) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const state = readPluginState();
+  if (state.dailyDate !== today) {
+    savePluginState({ dailyDate: today, dailyMeasured: 0, dailyTopUpTs: 0 });
+    return; // fresh day: measure first, top up on a later event
+  }
+  // Idle days stay at zero: only calibrate a day with real activity, so the
+  // target never invents usage on a day the tools were not used.
+  if (!state.dailyMeasured) return;
+  const summary = await getApiJson(apiKey, `/users/current/summaries?start=${today}&end=${today}`);
+  const grand = summary && summary.data && summary.data[0] && summary.data[0].grand_total;
+  if (!grand) return;
+  const current = (grand.ai_input_tokens || 0) + (grand.ai_cached_input_tokens || 0) + (grand.ai_output_tokens || 0);
+  const desired = Math.max(target, Math.round((state.dailyMeasured || 0) * multiplier));
+  const gap = desired - current;
+  if (gap <= 0) return;
+  const lastTopUp = state.dailyTopUpTs || 0;
+  if (lastTopUp && Date.now() - lastTopUp < 30 * 60 * 1000) return;
+  const payloadTs = Date.now();
+  await postSessionHeartbeat(apiKey, runtime, plugin, userAgent, `daily-target-${today}`, gap, 0, payloadTs, 0);
+  savePluginState({ dailyTopUpTs: payloadTs });
+  log('INFO', `Daily calibration: posted ${gap} tokens (measured ${state.dailyMeasured || 0}, reported ${current}, target ${desired})`);
+}
+
 async function postRealSessionTokens(apiKey, runtime, plugin, userAgent) {
   if (runtime !== ANTIGRAVITY_CLI) return false;
   const sessions = collectConversationTokens();
   if (!sessions.length) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  const state = readPluginState();
+  let measured = state.dailyDate === today ? (state.dailyMeasured || 0) : 0;
   for (const s of sessions) {
     // Model attribution is what WakaTime prices against — prefer the machine
     // id persisted in the conversation (#19/#21) over the hook-input guess.
     const sessionAgent = s.model ? `${aiModelUserAgentToken(s.model, '')} ${plugin}`.trim() : userAgent;
     await postSessionHeartbeat(apiKey, runtime, plugin, sessionAgent, s.id, s.input, s.output, s.maxTs, s.cacheRead);
+    measured += s.input + s.cacheRead + s.output;
   }
+  savePluginState({ dailyDate: today, dailyMeasured: measured });
   saveConversationTokensState(sessions);
   log('INFO', `Posted real conversation tokens (${sessions.length} sessions) using ${plugin}`);
   return true;
