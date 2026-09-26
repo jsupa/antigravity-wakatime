@@ -196,6 +196,7 @@ const FILE_TOOL_NAMES = new Set(['replace_file_content', 'write_to_file', 'creat
 const MAX_FILE_HEARTBEATS = 50;
 const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
 const MAX_TRANSCRIPTS_TO_SCAN = 3;
+const MAX_CONVERSATIONS_TO_SCAN = 60;
 
 function getBrainDirs(runtime) {
   // Antigravity always writes its brain under the OS home dir, separate from
@@ -687,8 +688,19 @@ function collectConversationTokens() {
     log('DEBUG', `conversations dir unreadable: ${err.message}`);
     return sessions;
   }
-  log('DEBUG', `conversation dbs: ${names.length} (${dir})`);
-  for (const name of names.slice(0, MAX_TRANSCRIPTS_TO_SCAN)) {
+  // Scan every conversation touched in the last two days, not just the newest
+  // few: a day's work is regularly spread over ~10 sessions, so a 3-db cap
+  // measured 144k of a 100M day. The cap only bounds pathological directories.
+  const recentCutoff = Date.now() - 48 * 60 * 60 * 1000;
+  const recent = names.filter((n) => {
+    try {
+      return fs.statSync(path.join(dir, n)).mtimeMs >= recentCutoff;
+    } catch (_) {
+      return false;
+    }
+  });
+  log('DEBUG', `conversation dbs: ${names.length} total, ${recent.length} recent (${dir})`);
+  for (const name of recent.slice(0, MAX_CONVERSATIONS_TO_SCAN)) {
     const id = name.replace(/\.db$/, '');
     const dbPath = path.join(dir, name);
     let gens;
@@ -708,7 +720,22 @@ function collectConversationTokens() {
     // whole history into one day (186M tokens arrived that way once).
     const gensMax = gens.reduce((m, g) => Math.max(m, g.idx), 0);
     const known = Object.prototype.hasOwnProperty.call(postedIdx, id);
-    const lastIdx = known ? postedIdx[id] : gensMax;
+    let lastIdx;
+    if (known) {
+      lastIdx = postedIdx[id];
+    } else {
+      // A conversation created today holds only today's work, so it is counted
+      // in full from its first generation. An older unseen conversation is
+      // adopted at its tip instead, so yesterday's history is never dumped
+      // into today's total.
+      let bornMs = 0;
+      try {
+        bornMs = fs.statSync(dbPath).birthtimeMs || 0;
+      } catch (_) {}
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      lastIdx = bornMs >= startOfToday.getTime() ? -1 : gensMax;
+    }
     const seen = new Set();
     let input = 0;
     let cacheRead = 0;
